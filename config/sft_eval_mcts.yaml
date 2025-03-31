@@ -1,5 +1,5 @@
 mode: "mcts"
-model_dir: "google/gemma-2-9b"
+model_dir: "google/gemma-2-9b-it"
 few_shot_path: "./rstar_deepthink/few_shots/few_shots.json"
 prompt_path: "./rstar_deepthink/few_shots/sft_prompt.json"
 swap_space: 12
