@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Sequence
 import io
+from tqdm import tqdm
 import torch
 import transformers
 from torch.utils.data import Dataset
@@ -129,19 +130,19 @@ def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedToken
     )
 
 
-def preprocess(
-    sources: Sequence[str],
-    targets: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-) -> Dict:
-    """Preprocess the data by tokenizing."""
-    examples = [s + t for s, t in zip(sources, targets)]
-    examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
-    input_ids = examples_tokenized["input_ids"]
-    labels = copy.deepcopy(input_ids)
-    for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
-        label[:source_len] = IGNORE_INDEX
-    return dict(input_ids=input_ids, labels=labels)
+# def preprocess(
+#     sources: Sequence[str],
+#     targets: Sequence[str],
+#     tokenizer: transformers.PreTrainedTokenizer,
+# ) -> Dict:
+#     """Preprocess the data by tokenizing."""
+#     examples = [s + t for s, t in zip(sources, targets)]
+#     examples_tokenized, sources_tokenized = [_tokenize_fn(strings, tokenizer) for strings in (examples, sources)]
+#     input_ids = examples_tokenized["input_ids"]
+#     labels = copy.deepcopy(input_ids)
+#     for label, source_len in zip(labels, sources_tokenized["input_ids_lens"]):
+#         label[:source_len] = IGNORE_INDEX
+#     return dict(input_ids=input_ids, labels=labels)
 
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
@@ -168,40 +169,76 @@ class SupervisedDataset(Dataset):
         # print('use length', len(list_data_dict))
 
         # logging.warning("Formatting inputs...")
-        prompt_input = PROMPT_DICT["prompt_input"]
-        # print(list_data_dict[0])
-        if 'instruction' in list_data_dict[0]:
-            pass
-        else:
-            def get_input(query):
-                if query.find('\n') == -1:
-                    return ''
-                return '\n'.join(query.split('\n')[1:])
-            list_data_dict = [{'instruction':data['query'], 'output':data['response']} for data in list_data_dict]
-        # import ipdb; ipdb.set_trace()
-        sources = [
-            prompt_input.format_map(example)
-            for example in list_data_dict 
-        ]
-        sources = []
-        for example in list_data_dict:
-            if example['instruction'] == '':
-                sources.append('')
-            else:
-                sources.append(prompt_input.format_map(example))
-        targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
+        #correction 2 start
+        logging.warning("Formatting inputs for Gemma-2 chat template...")
+        self.full_texts = []
+        self.source_lenghts = [] #Store length of user turn + model prompt for masking
 
-        self.sources = sources
-        self.targets = targets
+        instruction_key = 'instruction' if 'instruction' in list_data_dict[0] else 'query'
+        output_key = 'output' if 'output' in list_data_dict[0] else 'response'
+        print(f"Using keys: `{instruction_key}` and `{output_key}` for SFT data") #Added print verificaton
 
+        for example in tqdm(list_data_dict, desc="Formatting Data"):
+            user_content = example.get(instruction_key, "")
+            model_content = example.get(output_key, "")
+            if not user_content or not model_content:
+                logging.warning(f"Skipping example due to missing content: {example}")
+                continue
+
+        # 1. Construct the part to be masked (user turn + the trigger for model response)
+        # `<start_of_turn>model\n` is the prompt for the model to start generating
+        prompt_part = f"<start_of_turn>user\n{user_content}<end_of_turn>\n<start_of_turn>model\n"
+
+        # 2. construct the full text sequence for tokenization including the model's response and EOS
+
+        full_text = f"{prompt_part}{model_content}{tokenizer.eos_token}"
+        self.full_texts.append(full_text)
+
+        # 3. Tokenize only the prompt part to get its length for masking labels later
+        prompt_part_tokens = tokenizer(prompt_part, add_special_tokens = False)["input_ids"]
+        self.source_lenghts.append(len(prompt_part_tokens))
+        logging.warning(f"Formated {len(self.full_texts)} samples.")
+        if not self.full_texts:
+            raise ValueError("No data sanples were successfully formatted,. Check data keys and conent.")
+
+        # prompt_input = PROMPT_DICT["prompt_input"]
+        # # print(list_data_dict[0])
+        # if 'instruction' in list_data_dict[0]:
+        #     pass
+        # else:
+        #     def get_input(query):
+        #         if query.find('\n') == -1:
+        #             return ''
+        #         return '\n'.join(query.split('\n')[1:])
+        #     list_data_dict = [{'instruction':data['query'], 'output':data['response']} for data in list_data_dict]
+        # # import ipdb; ipdb.set_trace()
+        # sources = [
+        #     prompt_input.format_map(example)
+        #     for example in list_data_dict 
+        # ]
+        # sources = []
+        # for example in list_data_dict:
+        #     if example['instruction'] == '':
+        #         sources.append('')
+        #     else:
+        #         sources.append(prompt_input.format_map(example))
+        # targets = [f"{example['output']}{tokenizer.eos_token}" for example in list_data_dict]
+
+        # self.sources = sources
+        # self.targets = targets 
+
+# correction 2 end
     def __len__(self):
-        return len(self.sources)
+    #     return len(self.sources)
+            return(self.full_texts)
+
 
     def naive__getitem__(self, i) -> Dict[str, torch.Tensor]:
         return dict(input_ids=self.input_ids[i], labels=self.labels[i])
 
     def __getitem__(self, i):
-        return dict(input_ids=self.sources[i], labels=self.targets[i])
+    #     return dict(input_ids=self.sources[i], labels=self.targets[i])
+        return dict(text=self.full_texts[i], source_len = self.source_lenghts[i])
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
@@ -222,26 +259,51 @@ class DataCollatorForSupervisedDataset(object):
         )
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        sources = []
-        targets = []
-        for instance in instances:
-            source = instance['input_ids']
-            target = instance['labels']
-            sources.append(source)
-            targets.append(target)
+        #Extract text and source lenghts from instances provided by __getitem__
+        texts = [instance ['text'] for instance in instances]
+        source_lenghts = [instance['source_len'] for instance in instances]
 
-        data_dict = preprocess(sources, targets, self.tokenizer)
-        input_ids, labels = data_dict['input_ids'], data_dict['labels']
-        # input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
-        )
-        labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
-        return dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
+        data_dict = self.tokenizer(
+            texts,
+            return_tensors = "pt",
+            padding = "longest",
+            max_length = self.tokenizer.model_max_lenght,
+            truncation =True,
+            )
+
+        input_ids = data_dict["input_ids"]
+        labels = copy.deepcopy(input_ids)
+
+        for i, source_len in enumerate(source_lenghts):
+            mask_len = min(source_len, labels[i].size(0))
+            labels[i, :mask_len] = IGNORE_INDEX
+
+        labels[input_ids == self.tokenizer.pad_token_id] = IGNORE_INDEX
+
+        data_dict["labels"] = labels
+
+        return data_dict
+
+        # sources = []
+        # targets = []
+        # for instance in instances:
+        #     source = instance['input_ids']
+        #     target = instance['labels']
+        #     sources.append(source)
+        #     targets.append(target)
+
+        # data_dict = preprocess(sources, targets, self.tokenizer)
+        # input_ids, labels = data_dict['input_ids'], data_dict['labels']
+        # # input_ids, labels = tuple([instance[key] for instance in instances] for key in ("input_ids", "labels"))
+        # input_ids = torch.nn.utils.rnn.pad_sequence(
+        #     input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        # )
+        # labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=IGNORE_INDEX)
+        # return dict(
+        #     input_ids=input_ids,
+        #     labels=labels,
+        #     attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+        # )
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
@@ -278,23 +340,21 @@ def train():
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
-        padding_side="left" if "mistral" in model_args.model_name_or_path.lower() else "right",
+        padding_side= "right",
         trust_remote_code=True,
     )
-    if tokenizer.pad_token is None:
-        smart_tokenizer_and_embedding_resize(
-            special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
-            tokenizer=tokenizer,
-            model=model,
-        )
-    if "llama" in model_args.model_name_or_path.lower() and 'llama-3' not in model_args.model_name_or_path.lower():
-        tokenizer.add_special_tokens(
-            {
-                "eos_token": DEFAULT_EOS_TOKEN,
-                "bos_token": DEFAULT_BOS_TOKEN,
-                "unk_token": DEFAULT_UNK_TOKEN,
-            }
-        )
+
+    # if tokenizer.pad_token is None:
+    #     smart_tokenizer_and_embedding_resize(
+    #         special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN), # DEFAULT_PAD_TOKEN is "[PAD]"
+    #         tokenizer=tokenizer,
+    #         model=model,
+    #     )
+
+    if tokenizer.pad_token is None or tokenizer.pad_token_id is None:
+        print("Setting pad_token to eos_token for Gemma-2")
+        tokenizer.pad_token = tokenizer.eos_token
+
     tokenizer.add_special_tokens(
             {
                 "additional_special_tokens": ['<code>', '<end_of_step>', '<end_of_code>', '<output>', '<end_of_output>', '<answer>', '<end_of_answer>', '<|user|>', '<|assistant|>', '<refine>', '<end_of_refine>', '\n<|assistant|>', "<error_info>", "<end_of_error_info>", "<BACK>"]
